@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +28,8 @@ type Project struct {
 	StartDate time.Time `json:"start_date"`
 	DueDate   time.Time `json:"due_date"`
 	Done      bool      `json:"done"`
+	Tags      []string  `json:"tags,omitempty"`
+	Notes     string    `json:"notes,omitempty"`
 }
 
 // Storage file location: ~/.projtrack.json
@@ -118,11 +121,25 @@ func statusColorAndLabel(p Project, now time.Time) (string, string) {
 	}
 }
 
+func isOverdue(p Project, now time.Time) bool {
+	if p.Done {
+		return false
+	}
+	return p.DueDate.Before(truncateToDate(now))
+}
+
+func truncateToDate(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	name := fs.String("name", "", "Project name (required)")
 	startStr := fs.String("start", "", "Start date YYYY-MM-DD (optional, defaults to today)")
 	dueStr := fs.String("due", "", "Due date YYYY-MM-DD (required)")
+	tagsStr := fs.String("tags", "", "Comma-separated tags (optional)")
+	notes := fs.String("notes", "", "Notes/description (optional)")
 	fs.Parse(args)
 
 	if *name == "" {
@@ -162,12 +179,24 @@ func cmdAdd(args []string) {
 		os.Exit(1)
 	}
 
+	var tags []string
+	if *tagsStr != "" {
+		for _, t := range strings.Split(*tagsStr, ",") {
+			tag := strings.TrimSpace(t)
+			if tag != "" {
+				tags = append(tags, tag)
+			}
+		}
+	}
+
 	p := Project{
 		ID:        nextID(projects),
 		Name:      *name,
 		StartDate: startDate,
 		DueDate:   dueDate,
 		Done:      false,
+		Tags:      tags,
+		Notes:     *notes,
 	}
 
 	projects = append(projects, p)
@@ -179,11 +208,46 @@ func cmdAdd(args []string) {
 
 	fmt.Printf("Added project #%d: %s (start: %s, due: %s)\n",
 		p.ID, p.Name, formatDate(p.StartDate), formatDate(p.DueDate))
+	if len(p.Tags) > 0 {
+		fmt.Printf("  Tags: %s\n", strings.Join(p.Tags, ", "))
+	}
+	if strings.TrimSpace(p.Notes) != "" {
+		fmt.Println("  Notes:", p.Notes)
+	}
+}
+
+func hasTag(p Project, tag string) bool {
+	if tag == "" {
+		return true
+	}
+	for _, t := range p.Tags {
+		if strings.EqualFold(t, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesStatusFilter(p Project, status string, now time.Time) bool {
+	switch strings.ToLower(status) {
+	case "all", "":
+		return true
+	case "active":
+		return !p.Done
+	case "done":
+		return p.Done
+	case "overdue":
+		return isOverdue(p, now)
+	default:
+		// Unknown status -> treat as all
+		return true
+	}
 }
 
 func cmdList(args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	showAll := fs.Bool("all", true, "Show all projects (true by default)")
+	status := fs.String("status", "all", "Status filter: all|active|done|overdue")
+	tag := fs.String("tag", "", "Filter by tag (case-insensitive)")
 	fs.Parse(args)
 
 	projects, err := loadProjects()
@@ -204,21 +268,27 @@ func cmdList(args []string) {
 		return projects[i].DueDate.Before(projects[j].DueDate)
 	})
 
-	fmt.Println("ID  NAME                           START       DUE         STATUS")
-	fmt.Println("-------------------------------------------------------------------")
+	fmt.Println("ID  NAME                           START       DUE         STATUS               TAGS")
+	fmt.Println("----------------------------------------------------------------------------------------")
 	for _, p := range projects {
-		if !*showAll && p.Done {
+		if !matchesStatusFilter(p, *status, now) {
 			continue
 		}
-		color, status := statusColorAndLabel(p, now)
-		fmt.Printf("%-3d %-30s %-10s %-10s %s%-20s%s\n",
+		if !hasTag(p, *tag) {
+			continue
+		}
+
+		color, statusLabel := statusColorAndLabel(p, now)
+		tagsJoined := strings.Join(p.Tags, ",")
+		fmt.Printf("%-3d %-30s %-10s %-10s %s%-20s%s %-20s\n",
 			p.ID,
 			truncate(p.Name, 30),
 			formatDate(p.StartDate),
 			formatDate(p.DueDate),
 			color,
-			status,
+			statusLabel,
 			ColorReset,
+			truncate(tagsJoined, 20),
 		)
 	}
 }
@@ -278,6 +348,57 @@ func cmdDone(args []string) {
 	fmt.Printf("Marked project #%d as done.\n", id)
 }
 
+func cmdShow(args []string) {
+	fs := flag.NewFlagSet("show", flag.ExitOnError)
+	idStr := fs.String("id", "", "Project ID to show (required)")
+	fs.Parse(args)
+
+	if *idStr == "" {
+		fmt.Println("Error: -id is required")
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	id, err := strconv.Atoi(*idStr)
+	if err != nil {
+		fmt.Printf("Invalid ID: %v\n", err)
+		os.Exit(1)
+	}
+
+	projects, err := loadProjects()
+	if err != nil {
+		fmt.Printf("Error loading projects: %v\n", err)
+		os.Exit(1)
+	}
+
+	now := time.Now()
+	for _, p := range projects {
+		if p.ID == id {
+			color, statusLabel := statusColorAndLabel(p, now)
+			fmt.Printf("Project #%d\n", p.ID)
+			fmt.Println("--------------------------------------------------")
+			fmt.Println("Name:   ", p.Name)
+			fmt.Println("Start:  ", formatDate(p.StartDate))
+			fmt.Println("Due:    ", formatDate(p.DueDate))
+			fmt.Printf("Status: %s%s%s\n", color, statusLabel, ColorReset)
+			if len(p.Tags) > 0 {
+				fmt.Println("Tags:   ", strings.Join(p.Tags, ", "))
+			} else {
+				fmt.Println("Tags:    (none)")
+			}
+			if strings.TrimSpace(p.Notes) != "" {
+				fmt.Println("Notes:")
+				fmt.Println(p.Notes)
+			} else {
+				fmt.Println("Notes:   (none)")
+			}
+			return
+		}
+	}
+
+	fmt.Printf("No project with ID %d\n", id)
+}
+
 func printUsage() {
 	fmt.Println(`Usage:
   projtrack <command> [options]
@@ -286,11 +407,18 @@ Commands:
   add    Add a new project
   list   List projects
   done   Mark a project as done
+  show   Show full details for a project
 
 Examples:
-  projtrack add -name "FPGA Toolchain" -start 2025-11-21 -due 2025-12-10
+  projtrack add -name "FPGA Toolchain" -start 2025-11-21 -due 2025-12-10 \
+    -tags "work,fpga" -notes "Prototype flow with new board."
+
   projtrack list
-  projtrack done -id 1`)
+  projtrack list -status overdue
+  projtrack list -status active -tag work
+
+  projtrack done -id 1
+  projtrack show -id 1`)
 }
 
 func main() {
@@ -309,6 +437,8 @@ func main() {
 		cmdList(args)
 	case "done":
 		cmdDone(args)
+	case "show":
+		cmdShow(args)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
